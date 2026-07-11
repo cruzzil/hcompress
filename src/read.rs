@@ -13,6 +13,8 @@ pub enum DecodeError {
     MemoryAllocationError,
     BadFormatCode,
     BadFileFormat,
+    NumericalOverflow,
+    IncorrectAllocationSize,
 }
 
 /// The bit buffer
@@ -696,7 +698,6 @@ int scale;			 truncation scale factor that was used
     // Adjust y difference hy
     for i in (0..nxtop).step_by(2) {
         s00 = ny * i + 2;
-        s10 = s00 + ny;
 
         for _j in (2..(nytop - 2)).step_by(2) {
             hm = a[s00 - 2];
@@ -713,7 +714,6 @@ int scale;			 truncation scale factor that was used
                 a[s00 + 1] += s;
             }
             s00 += 2;
-            s10 += 2;
         }
     }
 
@@ -868,7 +868,6 @@ int scale;			 truncation scale factor that was used
     // Adjust y difference hy
     for i in (0..nxtop).step_by(2) {
         s00 = ny * i + 2;
-        s10 = s00 + ny;
 
         for _j in (2..(nytop - 2)).step_by(2) {
             hm = a[s00 - 2];
@@ -885,7 +884,6 @@ int scale;			 truncation scale factor that was used
                 a[s00 + 1] += s;
             }
             s00 += 2;
-            s10 += 2;
         }
     }
 
@@ -1020,6 +1018,15 @@ fn decode(infile: &mut Cursor<&[u8]>, a: &mut [i32]) -> Result<(usize, usize, i3
     let ny = readint(infile) as usize; // y size of image
     let scale = readint(infile); // scale factor for digitization
 
+    if (nx) > (i32::MAX as usize) / (ny) {
+        ffpmsg("numerical overflow during decompression");
+        return Err(DecodeError::NumericalOverflow);
+    }
+    if (nx) * (ny) > a.len() {
+        ffpmsg("wrong allocation size during decompression");
+        return Err(DecodeError::IncorrectAllocationSize);
+    }
+
     // sum of all pixels
     let sumall = readlonglong(infile);
 
@@ -1066,6 +1073,15 @@ fn decode64(infile: &mut Cursor<&[u8]>, a: &mut [i64]) -> Result<(usize, usize, 
     let nx = readint(infile) as usize; // x size of image
     let ny = readint(infile) as usize; // y size of image
     let scale = readint(infile); // scale factor for digitization
+
+    if (nx) > (i32::MAX as usize) / (ny) {
+        ffpmsg("numerical overflow during decompression");
+        return Err(DecodeError::NumericalOverflow);
+    }
+    if (nx) * (ny) > a.len() {
+        ffpmsg("wrong allocation size during decompression");
+        return Err(DecodeError::IncorrectAllocationSize);
+    }
 
     // sum of all pixels
     let sumall = readlonglong(infile);
@@ -1937,7 +1953,6 @@ fn qtree_bitins(a: &mut [u8], nx: usize, ny: usize, b: &mut [i32], n: usize, bit
             /*
                         b[s00  ] |= ((a[k]>>3) & 1) << bit;
             */
-            k += 1;
         }
     }
 }
@@ -2218,7 +2233,6 @@ fn qtree_bitins64(a: &mut [u8], nx: usize, ny: usize, b: &mut [i64], n: usize, b
             /*
                         b[s00  ] |= ((a[k]>>3) & 1) << bit;
             */
-            k += 1;
         }
     }
 }
@@ -2316,11 +2330,7 @@ fn input_huffman(infile: &mut Cursor<&[u8]>, b2: &mut Buffer2) -> i32 {
 
     // need the 6th bit
     c = input_bit(infile, b2) | (c << 1);
-    if c == 62 {
-        0
-    } else {
-        14
-    }
+    if c == 62 { 0 } else { 14 }
 }
 
 /*  ############################################################################  */
@@ -2344,8 +2354,8 @@ fn readint(infile: &mut Cursor<&[u8]>) -> i32 {
 
     let mut a: i32 = i32::from(b[0]);
 
-    for i in 1..4 {
-        a = (a << 8) + i32::from(b[i]);
+    for &byte in &b[1..4] {
+        a = (a << 8) + i32::from(byte);
     }
     a
 }
@@ -2368,8 +2378,8 @@ fn readlonglong(infile: &mut Cursor<&[u8]>) -> i64 {
 
     let mut a: i64 = i64::from(b[0]);
 
-    for i in 1..8 {
-        a = (a << 8) + i64::from(b[i]);
+    for &byte in &b[1..8] {
+        a = (a << 8) + i64::from(byte);
     }
     a
 }
@@ -2589,7 +2599,9 @@ mod tests {
 
         assert_eq!(
             output,
-            [-1, -1, -9584, -28561, -112, -24321, -1, -1, -1, -9584, -28561, -112]
+            [
+                -1, -1, -9584, -28561, -112, -24321, -1, -1, -1, -9584, -28561, -112
+            ]
         );
         assert_eq!(
             input,
@@ -2717,7 +2729,9 @@ mod tests {
 
         assert_eq!(
             output,
-            [-28662, -28528, 18761, 18761, 18761, 18761, 18761, 18761, -28528, -28528]
+            [
+                -28662, -28528, 18761, 18761, 18761, 18761, 18761, 18761, -28528, -28528
+            ]
         );
         assert_eq!(
             input,

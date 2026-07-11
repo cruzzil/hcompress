@@ -1,16 +1,22 @@
 [package]
 name = "hcompress"
-version = "0.3.0"
-edition = "2021"
-repository = "https://github.com/petesmc/hcompress.git"
-description = "HCompress Library"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.87"
+description = "A pure-Rust port of the CFITSIO HCompress image compression library"
+repository = "https://github.com/cruzzil/hcompress.git"
+homepage = "https://github.com/cruzzil/hcompress"
+documentation = "https://docs.rs/hcompress"
+readme = "README.md"
 license = "MIT"
+keywords = ["compression", "fits", "hcompress", "astronomy", "image"]
+categories = ["compression", "science"]
+exclude = ["c_example/", "fuzz/", ".github/", ".vscode/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 bytes = "1.10"
-arbitrary = { version = "1.4", optional = true, features = ["derive"] }
 bytemuck = "1.22"
 
 [dev-dependencies]

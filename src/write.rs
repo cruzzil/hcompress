@@ -187,8 +187,6 @@ fn htrans(a: &mut [i32], nx: usize, ny: usize) -> Result<(), EncodeError> {
                 hx = (a[s10] - a[s00]) << (1 - shift);
                 a[s10] = (if hx >= 0 { hx + prnd } else { hx }) & mask;
                 a[s00] = (if h0 >= 0 { h0 + prnd2 } else { h0 + nrnd2 }) & mask2;
-                s00 += 1;
-                s10 += 1;
             }
         }
 
@@ -336,8 +334,6 @@ fn htrans64(a: &mut [i64], nx: usize, ny: usize) -> Result<(), EncodeError> {
                 hx = (a[s10] - a[s00]) << (1 - shift);
                 a[s10] = (if hx >= 0 { hx + prnd } else { hx }) & mask;
                 a[s00] = (if h0 >= 0 { h0 + prnd2 } else { h0 + nrnd2 }) & mask2;
-                s00 += 1;
-                s10 += 1;
             }
         }
 
@@ -409,15 +405,15 @@ fn digitize(a: &mut [i32], nx: usize, ny: usize, scale: i32) {
     let d: i32 = (scale + 1) / 2 - 1;
 
     if d == 0 {
-        for p in 0..(nx * ny) {
-            a[p] /= scale;
+        for v in a.iter_mut().take(nx * ny) {
+            *v /= scale;
         }
     } else {
-        for p in 0..(nx * ny) {
-            if a[p] > 0 {
-                a[p] = (a[p] + d) / scale;
+        for v in a.iter_mut().take(nx * ny) {
+            if *v > 0 {
+                *v = (*v + d) / scale;
             } else {
-                a[p] = (a[p] - d) / scale;
+                *v = (*v - d) / scale;
             }
         }
     }
@@ -443,15 +439,15 @@ fn digitize64(a: &mut [i64], nx: usize, ny: usize, scale: i32) {
     let d: i64 = (scale + 1) / 2 - 1;
 
     if d == 0 {
-        for p in 0..(nx * ny) {
-            a[p] /= scale;
+        for v in a.iter_mut().take(nx * ny) {
+            *v /= scale;
         }
     } else {
-        for p in 0..(nx * ny) {
-            if a[p] > 0 {
-                a[p] = (a[p] + d) / scale;
+        for v in a.iter_mut().take(nx * ny) {
+            if *v > 0 {
+                *v = (*v + d) / scale;
             } else {
-                a[p] = (a[p] - d) / scale;
+                *v = (*v - d) / scale;
             }
         }
     }
@@ -582,13 +578,13 @@ fn encode<W: Write>(
     let mut nsign = 0;
     let mut bits_to_go = 8;
 
-    for i in 0..nel {
-        if a[i] > 0 {
+    for value in a.iter_mut().take(nel) {
+        if *value > 0 {
             // positive element, put zero at end of buffer
 
             signbits[nsign] <<= 1;
             bits_to_go -= 1;
-        } else if a[i] < 0 {
+        } else if *value < 0 {
             // negative element, shift in a one
 
             signbits[nsign] <<= 1;
@@ -596,7 +592,7 @@ fn encode<W: Write>(
             bits_to_go -= 1;
 
             //replace a by absolute value
-            a[i] = -a[i];
+            *value = -*value;
         }
 
         if bits_to_go == 0 {
@@ -628,10 +624,10 @@ fn encode<W: Write>(
     let ny2 = ny.div_ceil(2);
     let mut j = 0; /* column counter	*/
     let mut k = 0; /* row counter		*/
-    for i in 0..nel {
+    for &value in a.iter().take(nel) {
         let q = usize::from(j >= ny2) + usize::from(k >= nx2);
-        if vmax[q] < a[i] {
-            vmax[q] = a[i];
+        if vmax[q] < value {
+            vmax[q] = value;
         }
 
         j += 1;
@@ -718,13 +714,13 @@ fn encode64<W: Write>(
     let mut nsign = 0;
     let mut bits_to_go = 8;
 
-    for i in 0..nel {
-        if a[i] > 0 {
+    for value in a.iter_mut().take(nel) {
+        if *value > 0 {
             // positive element, put zero at end of buffer
 
             signbits[nsign] <<= 1;
             bits_to_go -= 1;
-        } else if a[i] < 0 {
+        } else if *value < 0 {
             // negative element, shift in a one
 
             signbits[nsign] <<= 1;
@@ -732,7 +728,7 @@ fn encode64<W: Write>(
             bits_to_go -= 1;
 
             //replace a by absolute value
-            a[i] = -a[i];
+            *value = -*value;
         }
 
         if bits_to_go == 0 {
@@ -764,10 +760,10 @@ fn encode64<W: Write>(
     let ny2 = ny.div_ceil(2);
     let mut j = 0; /* column counter	*/
     let mut k = 0; /* row counter		*/
-    for i in 0..nel {
+    for &value in a.iter().take(nel) {
         let q = usize::from(j >= ny2) + usize::from(k >= nx2);
-        if vmax[q] < a[i] {
-            vmax[q] = a[i];
+        if vmax[q] < value {
+            vmax[q] = value;
         }
 
         j += 1;
@@ -819,7 +815,7 @@ fn encode64<W: Write>(
 /// Number of bytes written (=n) if successful, <=0 if not
 ///
 fn qwrite<W: Write>(mut file: W, buffer: &[u8], n: usize) -> usize {
-    file.write_all(&buffer[0..n]);
+    let _ = file.write_all(&buffer[0..n]);
 
     n
 }
@@ -1064,7 +1060,7 @@ fn output_nbits<W: Write>(mut outfile: W, bits: i32, n: usize, b2: &mut Buffer2)
         // buffer full, put out top 8 bits
 
         // ((lbitbuffer>>(-bits_to_go2)) & 0xff)
-        outfile.write(&[(b2.buffer2 >> (-b2.bits_to_go2)) as u8]);
+        let _ = outfile.write_all(&[(b2.buffer2 >> (-b2.bits_to_go2)) as u8]);
         b2.bits_to_go2 += 8;
     }
     b2.bitcount += n;
@@ -1125,7 +1121,7 @@ fn output_nnybble<W: Write>(mut outfile: W, n: usize, array: &[u8], b2: &mut Buf
         // this actually seems to make very little difference in speed
         b2.buffer2 = 0;
         for _ii in 0..jj {
-            outfile.write(&[((array[kk] & 15) << 4) | (array[kk + 1] & 15)]);
+            let _ = outfile.write_all(&[((array[kk] & 15) << 4) | (array[kk + 1] & 15)]);
             kk += 2;
         }
     } else {
@@ -1136,7 +1132,7 @@ fn output_nnybble<W: Write>(mut outfile: W, n: usize, array: &[u8], b2: &mut Buf
 
             // buffer2 full, put out top 8 bits
 
-            outfile.write(&[((b2.buffer2 >> shift) & 0xff) as u8]);
+            let _ = outfile.write_all(&[((b2.buffer2 >> shift) & 0xff) as u8]);
         }
     }
 
@@ -1157,7 +1153,7 @@ fn output_nnybble<W: Write>(mut outfile: W, n: usize, array: &[u8], b2: &mut Buf
 /// * `buffer` - Buffer to write to
 fn done_outputing_bits<W: Write>(mut outfile: W, buffer: &mut Buffer2) {
     if buffer.bits_to_go2 < 8 {
-        outfile.write(&[(buffer.buffer2 << buffer.bits_to_go2) as u8]);
+        let _ = outfile.write_all(&[(buffer.buffer2 << buffer.bits_to_go2) as u8]);
 
         // count the garbage bits too
         buffer.bitcount += buffer.bits_to_go2 as usize;
@@ -1720,7 +1716,7 @@ fn qtree_reduce(a: &mut [u8], n: usize, nx: usize, ny: usize) {
             s10 += 2;
         }
 
-        if ny % 2 != 0 {
+        if !ny.is_multiple_of(2) {
             /*
              * row size is odd, do last element in row
              * s00+1,s10+1 are off edge
@@ -1731,7 +1727,7 @@ fn qtree_reduce(a: &mut [u8], n: usize, nx: usize, ny: usize) {
         ii += 2;
     }
 
-    if nx % 2 != 0 {
+    if !nx.is_multiple_of(2) {
         /*
          * column size is odd, do last row
          * s10,s10+1 are off edge
@@ -1747,7 +1743,7 @@ fn qtree_reduce(a: &mut [u8], n: usize, nx: usize, ny: usize) {
             s00 += 2;
         }
 
-        if ny % 2 != 0 {
+        if !ny.is_multiple_of(2) {
             /*
              * both row and column size are odd, do corner element
              * s00+1, s10, s10+1 are off edge
