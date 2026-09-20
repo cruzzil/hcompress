@@ -1,41 +1,103 @@
-on: push
-
 name: CI
 
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  ci:
+  docs:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust:
-          - stable
-          - beta
-          - nightly
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-          components: rustfmt, clippy
+      # The docs are warning-free; keep them that way.
+      - name: Build the documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
+  lint:
+    runs-on: ubuntu-latest
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+      - name: Output rust version for educational purposes
+        run: rustup --version
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+        # append `-- -D warnings' once the remaining lints are cleared
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          # args: -- -D warnings
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in sync with `rust-version' in Cargo.toml.
+      - name: Install the MSRV toolchain
+        run: |
+          rustup toolchain install 1.87.0 --profile minimal
+          rustup override set 1.87.0
+
+      - name: Build
+        run: cargo build --verbose
+
+  test:
+    name: test (${{ matrix.name }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, runner: ubuntu-latest, toolchain: stable }
+          - { name: linux-x64, runner: ubuntu-latest, toolchain: beta }
+          - { name: linux-x64, runner: ubuntu-latest, toolchain: nightly }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, toolchain: stable }
+          - { name: windows-x64, runner: windows-latest, toolchain: stable }
+          - { name: windows-arm64, runner: windows-11-arm, toolchain: stable, bootstrap-rustup: true }
+          - { name: macos-arm64, runner: macos-latest, toolchain: stable }
+          - { name: macos-intel, runner: macos-15-intel, toolchain: stable }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Windows 11 ARM64 runners ship without rustup, so fetch it first.
+      - name: Install rustup (Windows 11 ARM64)
+        if: matrix.bootstrap-rustup
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" -OutFile rustup-init.exe
+          .\rustup-init.exe --default-toolchain none -y
+          "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+          "CARGO_HOME=$env:USERPROFILE\.cargo" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+          rustup default ${{ matrix.toolchain }}
+      - name: Output rust version for educational purposes
+        run: rustup --version
+
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        env:
+          RUST_BACKTRACE: full
+        run: cargo test --verbose
