@@ -12,7 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
-        run: rustup update stable
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
+          rustup default 1.97.1
       - name: Output rust version for educational purposes
         run: rustup --version
       - name: Install cargo-llvm-cov
