@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/hcompress.svg)](https://crates.io/crates/hcompress)
 [![Actions Status](https://github.com/cruzzil/hcompress/workflows/CI/badge.svg)](https://github.com/cruzzil/hcompress/actions)
 [![Documentation](https://docs.rs/hcompress/badge.svg)](https://docs.rs/hcompress/)
-[![codecov](https://codecov.io/gh/cruzzil/hcompress/branch/master/graph/badge.svg?token=YZEX06JT7K)](https://codecov.io/gh/cruzzil/hcompress)
+[![codecov](https://codecov.io/gh/cruzzil/hcompress/graph/badge.svg?token=YZEX06JT7K)](https://codecov.io/gh/cruzzil/hcompress)
 [![Dependency status](https://deps.rs/repo/github/cruzzil/hcompress/status.svg)](https://deps.rs/repo/github/cruzzil/hcompress)
 
 A pure-Rust port of the [CFITSIO](https://heasarc.gsfc.nasa.gov/fitsio/) implementation of the
