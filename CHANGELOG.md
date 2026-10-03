@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The decoder no longer panics on malformed or truncated input; it returns a `DecodeError`
+  instead. A stream whose header gives a zero or negative dimension, or more bit planes than the
+  output integer holds (32 for `read`, 64 for `read64`), is rejected, and so is a stream that ends
+  early (`BadFileFormat`). Previously these hit a division by zero, an out-of-range shift, or a
+  read past the end of the input.
+- Arithmetic on coefficients read from the stream (the scale multiply, the inverse H-transform and
+  smoothing) now wraps as CFITSIO's C `int` arithmetic does, rather than panicking with overflow
+  checks on. Valid streams decode exactly as before.
+- Lossy streams (`scale > 1`): the last pixel's coefficient was not multiplied by the scale, so
+  the decoded image could differ from CFITSIO's. It now matches.
+- Decoding with smoothing (`smooth != 0`) panicked, or read past the coefficients it should
+  touch, whenever an expansion level was narrower than two pixels in either direction. It now
+  matches CFITSIO.
+- A 1 x 1 image decodes to its pixel value. The C original's inverse H-transform has undefined
+  behaviour here (`1 << -1`); the port panicked in debug builds and returned 0 in release builds.
+- For images one pixel wide, the decoder reads the (empty) fourth quadrant's bit planes as CFITSIO
+  does, instead of skipping them.
+
+### Changed
+- Dropped the `bytes` dependency, which nothing uses any more.
+
+### Added
+- `fuzz_decode` cargo-fuzz target, which feeds arbitrary bytes to `read` and `read64`, and
+  property tests that decode random and corrupted streams.
+
 ## [0.4.0] - 2026-07-11
 
 ### Changed
