@@ -1,7 +1,6 @@
 use std::io::Cursor;
 
 use bytemuck::cast_slice_mut;
-use bytes::Buf;
 
 use crate::CODE_MAGIC;
 
@@ -21,6 +20,7 @@ pub enum DecodeError {
 struct Buffer2 {
     pub buffer2: i32,    // Bits waiting to be input
     pub bits_to_go: i32, // Number of bits still in buffer
+    pub overrun: bool,   // A read went past the end of the stream
 }
 
 pub struct HCDecoder {}
@@ -153,6 +153,12 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
         log2n += 1;
     }
 
+    // A 1 x 1 image has no expansions to undo: a[0] already holds the pixel.
+    // (C goes on to compute 1 << (log2n - 1) = 1 << -1, which is undefined.)
+    if log2n == 0 {
+        return Ok(());
+    }
+
     // get temporary storage for shuffling elements
     let mut tmp: Vec<i32> = Vec::new();
     if tmp.try_reserve_exact(nmax.div_ceil(2)).is_err() {
@@ -177,8 +183,11 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
     let mut nrnd1 = prnd1 - 1;
     let nrnd2 = prnd2 - 1;
 
+    // The sums below use wrapping arithmetic, as C's int arithmetic does: a
+    // valid stream never overflows, but coefficients from a corrupt one can.
+
     // round h0 to multiple of bit2
-    a[0] = (a[0] + (if a[0] >= 0 { prnd2 } else { nrnd2 })) & mask2;
+    a[0] = a[0].wrapping_add(if a[0] >= 0 { prnd2 } else { nrnd2 }) & mask2;
 
     // do log2n expansions
     // We're indexing a as a 2-D array with dimensions (nx,ny).
@@ -239,14 +248,22 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
 
                 // round hx and hy to multiple of bit1, hc to multiple of bit0
                 // h0 is already a multiple of bit2
-                hx = (hx + (if hx >= 0 { prnd1 } else { nrnd1 })) & mask1;
-                hy = (hy + (if hy >= 0 { prnd1 } else { nrnd1 })) & mask1;
-                hc = (hc + (if hc >= 0 { prnd0 } else { nrnd0 })) & mask0;
+                hx = hx.wrapping_add(if hx >= 0 { prnd1 } else { nrnd1 }) & mask1;
+                hy = hy.wrapping_add(if hy >= 0 { prnd1 } else { nrnd1 }) & mask1;
+                hc = hc.wrapping_add(if hc >= 0 { prnd0 } else { nrnd0 }) & mask0;
 
                 // propagate bit0 of hc to hx,hy
                 lowbit0 = hc & bit0;
-                hx = if hx >= 0 { hx - lowbit0 } else { hx + lowbit0 };
-                hy = if hy >= 0 { hy - lowbit0 } else { hy + lowbit0 };
+                hx = if hx >= 0 {
+                    hx.wrapping_sub(lowbit0)
+                } else {
+                    hx.wrapping_add(lowbit0)
+                };
+                hy = if hy >= 0 {
+                    hy.wrapping_sub(lowbit0)
+                } else {
+                    hy.wrapping_add(lowbit0)
+                };
 
                 // Propagate bits 0 and 1 of hc,hx,hy to h0.
                 // This could be simplified if we assume h0>0, but then
@@ -254,9 +271,9 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
                 // negative pixels.
                 lowbit1 = (hc ^ hx ^ hy) & bit1;
                 h0 = if h0 >= 0 {
-                    h0 + lowbit0 - lowbit1
+                    h0.wrapping_add(lowbit0).wrapping_sub(lowbit1)
                 } else {
-                    h0 + (if lowbit0 == 0 {
+                    h0.wrapping_add(if lowbit0 == 0 {
                         lowbit1
                     } else {
                         lowbit0 - lowbit1
@@ -264,10 +281,10 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
                 };
 
                 // Divide sums by 2 (4 last time)
-                a[s10 + 1] = (h0 + hx + hy + hc) >> shift;
-                a[s10] = (h0 + hx - hy - hc) >> shift;
-                a[s00 + 1] = (h0 - hx + hy - hc) >> shift;
-                a[s00] = (h0 - hx - hy + hc) >> shift;
+                a[s10 + 1] = h0.wrapping_add(hx).wrapping_add(hy).wrapping_add(hc) >> shift;
+                a[s10] = h0.wrapping_add(hx).wrapping_sub(hy).wrapping_sub(hc) >> shift;
+                a[s00 + 1] = h0.wrapping_sub(hx).wrapping_add(hy).wrapping_sub(hc) >> shift;
+                a[s00] = h0.wrapping_sub(hx).wrapping_sub(hy).wrapping_add(hc) >> shift;
                 s00 += 2;
                 s10 += 2;
             }
@@ -277,11 +294,15 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
                 // s00+1, s10+1 are off edge
                 h0 = a[s00];
                 hx = a[s10];
-                hx = (if hx >= 0 { hx + prnd1 } else { hx + nrnd1 }) & mask1;
+                hx = hx.wrapping_add(if hx >= 0 { prnd1 } else { nrnd1 }) & mask1;
                 lowbit1 = hx & bit1;
-                h0 = if h0 >= 0 { h0 - lowbit1 } else { h0 + lowbit1 };
-                a[s10] = (h0 + hx) >> shift;
-                a[s00] = (h0 - hx) >> shift;
+                h0 = if h0 >= 0 {
+                    h0.wrapping_sub(lowbit1)
+                } else {
+                    h0.wrapping_add(lowbit1)
+                };
+                a[s10] = h0.wrapping_add(hx) >> shift;
+                a[s00] = h0.wrapping_sub(hx) >> shift;
             }
         }
 
@@ -293,11 +314,15 @@ fn hinv(a: &mut [i32], nx: usize, ny: usize, smooth: i32, scale: i32) -> Result<
             for _j in (0..(nytop - oddy)).step_by(2) {
                 h0 = a[s00];
                 hy = a[s00 + 1];
-                hy = (if hy >= 0 { hy + prnd1 } else { hy + nrnd1 }) & mask1;
+                hy = hy.wrapping_add(if hy >= 0 { prnd1 } else { nrnd1 }) & mask1;
                 lowbit1 = hy & bit1;
-                h0 = if h0 >= 0 { h0 - lowbit1 } else { h0 + lowbit1 };
-                a[s00 + 1] = (h0 + hy) >> shift;
-                a[s00] = (h0 - hy) >> shift;
+                h0 = if h0 >= 0 {
+                    h0.wrapping_sub(lowbit1)
+                } else {
+                    h0.wrapping_add(lowbit1)
+                };
+                a[s00 + 1] = h0.wrapping_add(hy) >> shift;
+                a[s00] = h0.wrapping_sub(hy) >> shift;
                 s00 += 2;
             }
 
@@ -357,6 +382,12 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
         log2n += 1;
     }
 
+    // A 1 x 1 image has no expansions to undo: a[0] already holds the pixel.
+    // (C goes on to compute 1 << (log2n - 1) = 1 << -1, which is undefined.)
+    if log2n == 0 {
+        return Ok(());
+    }
+
     // get temporary storage for shuffling elements
     let mut tmp: Vec<i64> = Vec::new();
     if tmp.try_reserve_exact(nmax.div_ceil(2)).is_err() {
@@ -381,8 +412,11 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
     let mut nrnd1 = prnd1 - 1;
     let nrnd2 = prnd2 - 1;
 
+    // The sums below use wrapping arithmetic, as C's int arithmetic does: a
+    // valid stream never overflows, but coefficients from a corrupt one can.
+
     // round h0 to multiple of bit2
-    a[0] = (a[0] + (if a[0] >= 0 { prnd2 } else { nrnd2 })) & mask2;
+    a[0] = a[0].wrapping_add(if a[0] >= 0 { prnd2 } else { nrnd2 }) & mask2;
 
     // do log2n expansions
     // We're indexing a as a 2-D array with dimensions (nx,ny).
@@ -443,14 +477,22 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
 
                 // round hx and hy to multiple of bit1, hc to multiple of bit0
                 // h0 is already a multiple of bit2
-                hx = (hx + (if hx >= 0 { prnd1 } else { nrnd1 })) & mask1;
-                hy = (hy + (if hy >= 0 { prnd1 } else { nrnd1 })) & mask1;
-                hc = (hc + (if hc >= 0 { prnd0 } else { nrnd0 })) & mask0;
+                hx = hx.wrapping_add(if hx >= 0 { prnd1 } else { nrnd1 }) & mask1;
+                hy = hy.wrapping_add(if hy >= 0 { prnd1 } else { nrnd1 }) & mask1;
+                hc = hc.wrapping_add(if hc >= 0 { prnd0 } else { nrnd0 }) & mask0;
 
                 // propagate bit0 of hc to hx,hy
                 lowbit0 = hc & bit0;
-                hx = if hx >= 0 { hx - lowbit0 } else { hx + lowbit0 };
-                hy = if hy >= 0 { hy - lowbit0 } else { hy + lowbit0 };
+                hx = if hx >= 0 {
+                    hx.wrapping_sub(lowbit0)
+                } else {
+                    hx.wrapping_add(lowbit0)
+                };
+                hy = if hy >= 0 {
+                    hy.wrapping_sub(lowbit0)
+                } else {
+                    hy.wrapping_add(lowbit0)
+                };
 
                 // Propagate bits 0 and 1 of hc,hx,hy to h0.
                 // This could be simplified if we assume h0>0, but then
@@ -458,9 +500,9 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
                 // negative pixels.
                 lowbit1 = (hc ^ hx ^ hy) & bit1;
                 h0 = if h0 >= 0 {
-                    h0 + lowbit0 - lowbit1
+                    h0.wrapping_add(lowbit0).wrapping_sub(lowbit1)
                 } else {
-                    h0 + (if lowbit0 == 0 {
+                    h0.wrapping_add(if lowbit0 == 0 {
                         lowbit1
                     } else {
                         lowbit0 - lowbit1
@@ -468,10 +510,10 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
                 };
 
                 // Divide sums by 2 (4 last time)
-                a[s10 + 1] = (h0 + hx + hy + hc) >> shift;
-                a[s10] = (h0 + hx - hy - hc) >> shift;
-                a[s00 + 1] = (h0 - hx + hy - hc) >> shift;
-                a[s00] = (h0 - hx - hy + hc) >> shift;
+                a[s10 + 1] = h0.wrapping_add(hx).wrapping_add(hy).wrapping_add(hc) >> shift;
+                a[s10] = h0.wrapping_add(hx).wrapping_sub(hy).wrapping_sub(hc) >> shift;
+                a[s00 + 1] = h0.wrapping_sub(hx).wrapping_add(hy).wrapping_sub(hc) >> shift;
+                a[s00] = h0.wrapping_sub(hx).wrapping_sub(hy).wrapping_add(hc) >> shift;
                 s00 += 2;
                 s10 += 2;
             }
@@ -481,11 +523,15 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
                 // s00+1, s10+1 are off edge
                 h0 = a[s00];
                 hx = a[s10];
-                hx = (if hx >= 0 { hx + prnd1 } else { hx + nrnd1 }) & mask1;
+                hx = hx.wrapping_add(if hx >= 0 { prnd1 } else { nrnd1 }) & mask1;
                 lowbit1 = hx & bit1;
-                h0 = if h0 >= 0 { h0 - lowbit1 } else { h0 + lowbit1 };
-                a[s10] = (h0 + hx) >> shift;
-                a[s00] = (h0 - hx) >> shift;
+                h0 = if h0 >= 0 {
+                    h0.wrapping_sub(lowbit1)
+                } else {
+                    h0.wrapping_add(lowbit1)
+                };
+                a[s10] = h0.wrapping_add(hx) >> shift;
+                a[s00] = h0.wrapping_sub(hx) >> shift;
             }
         }
 
@@ -497,11 +543,15 @@ fn hinv64(a: &mut [i64], nx: usize, ny: usize, smooth: i32, scale: i32) -> Resul
             for _j in (0..(nytop - oddy)).step_by(2) {
                 h0 = a[s00];
                 hy = a[s00 + 1];
-                hy = (if hy >= 0 { hy + prnd1 } else { hy + nrnd1 }) & mask1;
+                hy = hy.wrapping_add(if hy >= 0 { prnd1 } else { nrnd1 }) & mask1;
                 lowbit1 = hy & bit1;
-                h0 = if h0 >= 0 { h0 - lowbit1 } else { h0 + lowbit1 };
-                a[s00 + 1] = (h0 + hy) >> shift;
-                a[s00] = (h0 - hy) >> shift;
+                h0 = if h0 >= 0 {
+                    h0.wrapping_sub(lowbit1)
+                } else {
+                    h0.wrapping_add(lowbit1)
+                };
+                a[s00 + 1] = h0.wrapping_add(hy) >> shift;
+                a[s00] = h0.wrapping_sub(hy) >> shift;
                 s00 += 2;
             }
 
@@ -657,9 +707,12 @@ int scale;			 truncation scale factor that was used
     // only (nxtop,nytop) are used.  The coefficients on the edge of the
     // array are not adjusted (which is why the loops below start at 2
     // instead of 0 and end at nxtop-2 instead of nxtop.)
+    //
+    // C's int loop bounds simply go negative when nxtop or nytop is below 2;
+    // with usize they must saturate.  Arithmetic wraps as in hinv.
 
     // Adjust x difference hx
-    for i in (2..(nxtop - 2)).step_by(2) {
+    for i in (2..nxtop.saturating_sub(2)).step_by(2) {
         s00 = ny * i; // s00 is index of a[i,j]
         s10 = s00 + ny; // s10 is index of a[i+1,j]
 
@@ -670,11 +723,11 @@ int scale;			 truncation scale factor that was used
             hp = a[s00 + ny2];
 
             // diff = 8 * hx slope that would match h0 in neighboring zones
-            diff = hp - hm;
+            diff = hp.wrapping_sub(hm);
 
             // monotonicity constraints on diff
-            dmax = i32::max(i32::min(hp - h0, h0 - hm), 0) << 2;
-            dmin = i32::min(i32::max(hp - h0, h0 - hm), 0) << 2;
+            dmax = i32::max(i32::min(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
+            dmin = i32::min(i32::max(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
 
             // if monotonicity would set slope = 0 then don't change hx.
             // note dmax>=0, dmin<=0.
@@ -685,10 +738,14 @@ int scale;			 truncation scale factor that was used
                 // Careful with rounding negative numbers when using
                 // shift for divide by 8.
 
-                s = diff - (a[s10] << 3);
-                s = if s >= 0 { s >> 3 } else { (s + 7) >> 3 };
+                s = diff.wrapping_sub(a[s10] << 3);
+                s = if s >= 0 {
+                    s >> 3
+                } else {
+                    s.wrapping_add(7) >> 3
+                };
                 s = i32::max(i32::min(s, smax), -smax);
-                a[s10] += s;
+                a[s10] = a[s10].wrapping_add(s);
             }
             s00 += 2;
             s10 += 2;
@@ -699,30 +756,34 @@ int scale;			 truncation scale factor that was used
     for i in (0..nxtop).step_by(2) {
         s00 = ny * i + 2;
 
-        for _j in (2..(nytop - 2)).step_by(2) {
+        for _j in (2..nytop.saturating_sub(2)).step_by(2) {
             hm = a[s00 - 2];
             h0 = a[s00];
             hp = a[s00 + 2];
-            diff = hp - hm;
-            dmax = i32::max(i32::min(hp - h0, h0 - hm), 0) << 2;
-            dmin = i32::min(i32::max(hp - h0, h0 - hm), 0) << 2;
+            diff = hp.wrapping_sub(hm);
+            dmax = i32::max(i32::min(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
+            dmin = i32::min(i32::max(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
             if dmin < dmax {
                 diff = i32::max(i32::min(diff, dmax), dmin);
-                s = diff - (a[s00 + 1] << 3);
-                s = if s >= 0 { s >> 3 } else { (s + 7) >> 3 };
+                s = diff.wrapping_sub(a[s00 + 1] << 3);
+                s = if s >= 0 {
+                    s >> 3
+                } else {
+                    s.wrapping_add(7) >> 3
+                };
                 s = i32::max(i32::min(s, smax), -smax);
-                a[s00 + 1] += s;
+                a[s00 + 1] = a[s00 + 1].wrapping_add(s);
             }
             s00 += 2;
         }
     }
 
     // Adjust curvature difference hc
-    for i in (2..(nxtop - 2)).step_by(2) {
+    for i in (2..nxtop.saturating_sub(2)).step_by(2) {
         s00 = ny * i + 2;
         s10 = s00 + ny;
 
-        for _j in (2..(nytop - 2)).step_by(2) {
+        for _j in (2..nytop.saturating_sub(2)).step_by(2) {
             /*
              * ------------------    y
              * | hmp |    | hpp |    |
@@ -739,7 +800,7 @@ int scale;			 truncation scale factor that was used
             h0 = a[s00];
 
             // diff = 64 * hc value that would match h0 in neighboring zones
-            diff = hpp + hmm - hmp - hpm;
+            diff = hpp.wrapping_add(hmm).wrapping_sub(hmp).wrapping_sub(hpm);
 
             // 2 times x,y slopes in this zone
             hx2 = a[s10] << 1;
@@ -747,21 +808,37 @@ int scale;			 truncation scale factor that was used
 
             // monotonicity constraints on diff
             m1 = i32::min(
-                i32::max(hpp - h0, 0) - hx2 - hy2,
-                i32::max(h0 - hpm, 0) + hx2 - hy2,
+                i32::max(hpp.wrapping_sub(h0), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_sub(hy2),
+                i32::max(h0.wrapping_sub(hpm), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_sub(hy2),
             );
             m2 = i32::min(
-                i32::max(h0 - hmp, 0) - hx2 + hy2,
-                i32::max(hmm - h0, 0) + hx2 + hy2,
+                i32::max(h0.wrapping_sub(hmp), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_add(hy2),
+                i32::max(hmm.wrapping_sub(h0), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_add(hy2),
             );
             dmax = i32::min(m1, m2) << 4;
             m1 = i32::max(
-                i32::min(hpp - h0, 0) - hx2 - hy2,
-                i32::min(h0 - hpm, 0) + hx2 - hy2,
+                i32::min(hpp.wrapping_sub(h0), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_sub(hy2),
+                i32::min(h0.wrapping_sub(hpm), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_sub(hy2),
             );
             m2 = i32::max(
-                i32::min(h0 - hmp, 0) - hx2 + hy2,
-                i32::min(hmm - h0, 0) + hx2 + hy2,
+                i32::min(h0.wrapping_sub(hmp), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_add(hy2),
+                i32::min(hmm.wrapping_sub(h0), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_add(hy2),
             );
             dmin = i32::max(m1, m2) << 4;
 
@@ -774,10 +851,14 @@ int scale;			 truncation scale factor that was used
                 // Careful with rounding negative numbers when using
                 // shift for divide by 64.
 
-                s = diff - (a[s10 + 1] << 6);
-                s = if s >= 0 { s >> 6 } else { (s + 63) >> 6 };
+                s = diff.wrapping_sub(a[s10 + 1] << 6);
+                s = if s >= 0 {
+                    s >> 6
+                } else {
+                    s.wrapping_add(63) >> 6
+                };
                 s = i32::max(i32::min(s, smax), -smax);
-                a[s10 + 1] += s;
+                a[s10 + 1] = a[s10 + 1].wrapping_add(s);
             }
             s00 += 2;
             s10 += 2;
@@ -827,9 +908,12 @@ int scale;			 truncation scale factor that was used
     // only (nxtop,nytop) are used.  The coefficients on the edge of the
     // array are not adjusted (which is why the loops below start at 2
     // instead of 0 and end at nxtop-2 instead of nxtop.)
+    //
+    // C's int loop bounds simply go negative when nxtop or nytop is below 2;
+    // with usize they must saturate.  Arithmetic wraps as in hinv.
 
     // Adjust x difference hx
-    for i in (2..(nxtop - 2)).step_by(2) {
+    for i in (2..nxtop.saturating_sub(2)).step_by(2) {
         s00 = ny * i; // s00 is index of a[i,j]
         s10 = s00 + ny; // s10 is index of a[i+1,j]
 
@@ -840,11 +924,11 @@ int scale;			 truncation scale factor that was used
             hp = a[s00 + ny2];
 
             // diff = 8 * hx slope that would match h0 in neighboring zones
-            diff = hp - hm;
+            diff = hp.wrapping_sub(hm);
 
             // monotonicity constraints on diff
-            dmax = i64::max(i64::min(hp - h0, h0 - hm), 0) << 2;
-            dmin = i64::min(i64::max(hp - h0, h0 - hm), 0) << 2;
+            dmax = i64::max(i64::min(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
+            dmin = i64::min(i64::max(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
 
             // if monotonicity would set slope = 0 then don't change hx.
             // note dmax>=0, dmin<=0.
@@ -855,10 +939,14 @@ int scale;			 truncation scale factor that was used
                 // Careful with rounding negative numbers when using
                 // shift for divide by 8.
 
-                s = diff - (a[s10] << 3);
-                s = if s >= 0 { s >> 3 } else { (s + 7) >> 3 };
+                s = diff.wrapping_sub(a[s10] << 3);
+                s = if s >= 0 {
+                    s >> 3
+                } else {
+                    s.wrapping_add(7) >> 3
+                };
                 s = i64::max(i64::min(s, smax), -smax);
-                a[s10] += s;
+                a[s10] = a[s10].wrapping_add(s);
             }
             s00 += 2;
             s10 += 2;
@@ -869,30 +957,34 @@ int scale;			 truncation scale factor that was used
     for i in (0..nxtop).step_by(2) {
         s00 = ny * i + 2;
 
-        for _j in (2..(nytop - 2)).step_by(2) {
+        for _j in (2..nytop.saturating_sub(2)).step_by(2) {
             hm = a[s00 - 2];
             h0 = a[s00];
             hp = a[s00 + 2];
-            diff = hp - hm;
-            dmax = i64::max(i64::min(hp - h0, h0 - hm), 0) << 2;
-            dmin = i64::min(i64::max(hp - h0, h0 - hm), 0) << 2;
+            diff = hp.wrapping_sub(hm);
+            dmax = i64::max(i64::min(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
+            dmin = i64::min(i64::max(hp.wrapping_sub(h0), h0.wrapping_sub(hm)), 0) << 2;
             if dmin < dmax {
                 diff = i64::max(i64::min(diff, dmax), dmin);
-                s = diff - (a[s00 + 1] << 3);
-                s = if s >= 0 { s >> 3 } else { (s + 7) >> 3 };
+                s = diff.wrapping_sub(a[s00 + 1] << 3);
+                s = if s >= 0 {
+                    s >> 3
+                } else {
+                    s.wrapping_add(7) >> 3
+                };
                 s = i64::max(i64::min(s, smax), -smax);
-                a[s00 + 1] += s;
+                a[s00 + 1] = a[s00 + 1].wrapping_add(s);
             }
             s00 += 2;
         }
     }
 
     // Adjust curvature difference hc
-    for i in (2..(nxtop - 2)).step_by(2) {
+    for i in (2..nxtop.saturating_sub(2)).step_by(2) {
         s00 = ny * i + 2;
         s10 = s00 + ny;
 
-        for _j in (2..(nytop - 2)).step_by(2) {
+        for _j in (2..nytop.saturating_sub(2)).step_by(2) {
             /*
              * ------------------    y
              * | hmp |    | hpp |    |
@@ -909,7 +1001,7 @@ int scale;			 truncation scale factor that was used
             h0 = a[s00];
 
             // diff = 64 * hc value that would match h0 in neighboring zones
-            diff = hpp + hmm - hmp - hpm;
+            diff = hpp.wrapping_add(hmm).wrapping_sub(hmp).wrapping_sub(hpm);
 
             // 2 times x,y slopes in this zone
             hx2 = a[s10] << 1;
@@ -917,21 +1009,37 @@ int scale;			 truncation scale factor that was used
 
             // monotonicity constraints on diff
             m1 = i64::min(
-                i64::max(hpp - h0, 0) - hx2 - hy2,
-                i64::max(h0 - hpm, 0) + hx2 - hy2,
+                i64::max(hpp.wrapping_sub(h0), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_sub(hy2),
+                i64::max(h0.wrapping_sub(hpm), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_sub(hy2),
             );
             m2 = i64::min(
-                i64::max(h0 - hmp, 0) - hx2 + hy2,
-                i64::max(hmm - h0, 0) + hx2 + hy2,
+                i64::max(h0.wrapping_sub(hmp), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_add(hy2),
+                i64::max(hmm.wrapping_sub(h0), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_add(hy2),
             );
             dmax = i64::min(m1, m2) << 4;
             m1 = i64::max(
-                i64::min(hpp - h0, 0) - hx2 - hy2,
-                i64::min(h0 - hpm, 0) + hx2 - hy2,
+                i64::min(hpp.wrapping_sub(h0), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_sub(hy2),
+                i64::min(h0.wrapping_sub(hpm), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_sub(hy2),
             );
             m2 = i64::max(
-                i64::min(h0 - hmp, 0) - hx2 + hy2,
-                i64::min(hmm - h0, 0) + hx2 + hy2,
+                i64::min(h0.wrapping_sub(hmp), 0)
+                    .wrapping_sub(hx2)
+                    .wrapping_add(hy2),
+                i64::min(hmm.wrapping_sub(h0), 0)
+                    .wrapping_add(hx2)
+                    .wrapping_add(hy2),
             );
             dmin = i64::max(m1, m2) << 4;
 
@@ -944,10 +1052,14 @@ int scale;			 truncation scale factor that was used
                 // Careful with rounding negative numbers when using
                 // shift for divide by 64.
 
-                s = diff - (a[s10 + 1] << 6);
-                s = if s >= 0 { s >> 6 } else { (s + 63) >> 6 };
+                s = diff.wrapping_sub(a[s10 + 1] << 6);
+                s = if s >= 0 {
+                    s >> 6
+                } else {
+                    s.wrapping_add(63) >> 6
+                };
                 s = i64::max(i64::min(s, smax), -smax);
-                a[s10 + 1] += s;
+                a[s10 + 1] = a[s10 + 1].wrapping_add(s);
             }
             s00 += 2;
             s10 += 2;
@@ -963,12 +1075,11 @@ fn undigitize(a: &mut [i32], nx: usize, ny: usize, scale: i32) {
         return;
     }
 
-    if nx == 0 || ny == 0 {
-        return;
-    }
-
-    for item in a.iter_mut().take(nx * ny - 1) {
-        *item *= scale;
+    // C multiplies every pixel, a[0] through a[nx*ny-1], in plain int
+    // arithmetic; wrapping_mul gives its two's-complement result for
+    // coefficients that a corrupt stream has made too large.
+    for item in a.iter_mut().take(nx * ny) {
+        *item = item.wrapping_mul(scale);
     }
 }
 
@@ -982,123 +1093,110 @@ fn undigitize64(a: &mut [i64], nx: usize, ny: usize, scale: i32) {
 
     let scale64: i64 = i64::from(scale); // use a 64-bit int for efficiency in the big loop
 
-    if nx == 0 || ny == 0 {
-        return;
+    // See undigitize: every pixel, with C's wrapping arithmetic.
+    a.iter_mut()
+        .take(nx * ny)
+        .for_each(|x| *x = x.wrapping_mul(scale64));
+}
+
+/*  ############################################################################  */
+/// The fixed-size header at the start of a compressed stream.
+struct Header {
+    nx: usize,
+    ny: usize,
+    scale: i32,
+    sumall: i64,
+    nbitplanes: [u8; 3],
+}
+
+/*  ############################################################################  */
+/// Read and validate the stream header.
+///
+/// `a_len` is the length of the caller's output array, and `max_bitplanes`
+/// the width in bits of its elements: a quadrant cannot hold more bit planes
+/// than that, and the decoder would shift past the end of the integer if it
+/// tried.  CFITSIO checks only that `nx * ny` fits in an `int`; the other
+/// checks reject streams that it would decode with undefined behaviour.
+fn read_header(
+    infile: &mut Cursor<&[u8]>,
+    a_len: usize,
+    max_bitplanes: u8,
+) -> Result<Header, DecodeError> {
+    let mut tmagic: [u8; 2] = [0; 2];
+
+    // File starts either with special 2-byte magic code or with
+    // FITS keyword "SIMPLE  ="
+    qread(infile, &mut tmagic, 2)?;
+
+    // check for correct magic code value
+    if !tmagic.eq(&CODE_MAGIC) {
+        ffpmsg("bad file format");
+        return Err(DecodeError::BadFileFormat);
     }
 
-    a.iter_mut().take(nx * ny - 1).for_each(|x| *x *= scale64);
+    let nx = readint(infile)?; // x size of image
+    let ny = readint(infile)?; // y size of image
+    let scale = readint(infile)?; // scale factor for digitization
+
+    if nx <= 0 || ny <= 0 {
+        ffpmsg("bad image dimensions during decompression");
+        return Err(DecodeError::BadFileFormat);
+    }
+    let (nx, ny) = (nx as usize, ny as usize);
+
+    if nx > (i32::MAX as usize) / ny {
+        ffpmsg("numerical overflow during decompression");
+        return Err(DecodeError::NumericalOverflow);
+    }
+    if nx * ny > a_len {
+        ffpmsg("wrong allocation size during decompression");
+        return Err(DecodeError::IncorrectAllocationSize);
+    }
+
+    // sum of all pixels
+    let sumall = readlonglong(infile)?;
+
+    // # bits in quadrants
+    let mut nbitplanes: [u8; 3] = [0; 3];
+    qread(infile, &mut nbitplanes, 3)?;
+    if nbitplanes.iter().any(|&nb| nb > max_bitplanes) {
+        ffpmsg("bad bit plane values during decompression");
+        return Err(DecodeError::BadBitPlaneValues);
+    }
+
+    Ok(Header {
+        nx,
+        ny,
+        scale,
+        sumall,
+        nbitplanes,
+    })
 }
 
 /*  ############################################################################  */
 /// read codes from infile and construct array
 fn decode(infile: &mut Cursor<&[u8]>, a: &mut [i32]) -> Result<(usize, usize, i32), DecodeError> {
-    //nx: usize, ny: usize, scale: i32
-    /*
-    char *infile;				 input file
-    int  *a;				 address of output array [nx][ny]
-    int  *nx,*ny;				 size of output array
-    int  *scale;				 scale factor for digitization
-    */
+    let hdr = read_header(infile, a.len(), 32)?;
 
-    let mut nbitplanes: [u8; 3] = [0; 3];
-    let mut tmagic: [u8; 2] = [0; 2];
-    // initialize the byte read position to the beginning of the array
-
-    // File starts either with special 2-byte magic code or with
-    // FITS keyword "SIMPLE  ="
-    qread(infile, &mut tmagic, 2);
-
-    // check for correct magic code value
-    if !tmagic.eq(&CODE_MAGIC) {
-        ffpmsg("bad file format");
-        return Err(DecodeError::BadFileFormat);
-    }
-
-    let nx = readint(infile) as usize; // x size of image
-    let ny = readint(infile) as usize; // y size of image
-    let scale = readint(infile); // scale factor for digitization
-
-    if (nx) > (i32::MAX as usize) / (ny) {
-        ffpmsg("numerical overflow during decompression");
-        return Err(DecodeError::NumericalOverflow);
-    }
-    if (nx) * (ny) > a.len() {
-        ffpmsg("wrong allocation size during decompression");
-        return Err(DecodeError::IncorrectAllocationSize);
-    }
-
-    // sum of all pixels
-    let sumall = readlonglong(infile);
-
-    // # bits in quadrants
-    let len = nbitplanes.len();
-    qread(infile, &mut nbitplanes, len);
-
-    let stat = dodecode(infile, a, nx, ny, nbitplanes);
+    let stat = dodecode(infile, a, hdr.nx, hdr.ny, hdr.nbitplanes);
 
     // put sum of all pixels back into pixel 0
-    a[0] = sumall as i32;
+    a[0] = hdr.sumall as i32;
 
-    match stat {
-        Ok(_) => Ok((nx, ny, scale)),
-        Err(e) => Err(e),
-    }
+    stat.map(|_| (hdr.nx, hdr.ny, hdr.scale))
 }
 
 /*  ############################################################################  */
 /// read codes from infile and construct array
 fn decode64(infile: &mut Cursor<&[u8]>, a: &mut [i64]) -> Result<(usize, usize, i32), DecodeError> {
-    //nx: usize, ny: usize, scale: i32
-    /*
-    char *infile;				 input file
-    i64  *a;				 address of output array [nx][ny]
-    int  *nx,*ny;				 size of output array
-    int  *scale;				 scale factor for digitization
-    */
+    let hdr = read_header(infile, a.len(), 64)?;
 
-    let mut nbitplanes: [u8; 3] = [0; 3];
-    let mut tmagic: [u8; 2] = [0; 2];
-    // initialize the byte read position to the beginning of the array
-
-    // File starts either with special 2-byte magic code or with
-    // FITS keyword "SIMPLE  ="
-    qread(infile, &mut tmagic, 2);
-
-    // check for correct magic code value
-    if !tmagic.eq(&CODE_MAGIC) {
-        ffpmsg("bad file format");
-        return Err(DecodeError::BadFileFormat);
-    }
-
-    let nx = readint(infile) as usize; // x size of image
-    let ny = readint(infile) as usize; // y size of image
-    let scale = readint(infile); // scale factor for digitization
-
-    if (nx) > (i32::MAX as usize) / (ny) {
-        ffpmsg("numerical overflow during decompression");
-        return Err(DecodeError::NumericalOverflow);
-    }
-    if (nx) * (ny) > a.len() {
-        ffpmsg("wrong allocation size during decompression");
-        return Err(DecodeError::IncorrectAllocationSize);
-    }
-
-    // sum of all pixels
-    let sumall = readlonglong(infile);
-
-    // # bits in quadrants
-    let len = nbitplanes.len();
-    qread(infile, &mut nbitplanes, len);
-
-    let stat = dodecode64(infile, a, nx, ny, nbitplanes);
+    let stat = dodecode64(infile, a, hdr.nx, hdr.ny, hdr.nbitplanes);
 
     // put sum of all pixels back into pixel 0
-    a[0] = sumall;
+    a[0] = hdr.sumall;
 
-    match stat {
-        Ok(_) => Ok((nx, ny, scale)),
-        Err(e) => Err(e),
-    }
+    stat.map(|_| (hdr.nx, hdr.ny, hdr.scale))
 }
 
 /*  ############################################################################  */
@@ -1151,16 +1249,23 @@ fn dodecode(
         &mut b2,
     )?;
 
-    if ny * nx2 + ny2 < a.len() {
-        qtree_decode(
-            infile,
-            &mut a[(ny * nx2 + ny2)..],
-            ny,
-            nx / 2,
-            ny / 2,
-            i32::from(nbitplanes[2]),
-            &mut b2,
-        )?;
+    // When nx or ny is 1 this quadrant is empty and its offset can lie one
+    // past the end of the image; C still reads its (empty) bit planes, so do
+    // the same rather than skip them.
+    let q4 = (ny * nx2 + ny2).min(a.len());
+    qtree_decode(
+        infile,
+        &mut a[q4..],
+        ny,
+        nx / 2,
+        ny / 2,
+        i32::from(nbitplanes[2]),
+        &mut b2,
+    )?;
+
+    if b2.overrun {
+        ffpmsg("dodecode: compressed stream is truncated");
+        return Err(DecodeError::BadFileFormat);
     }
 
     // make sure there is an EOF symbol (nybble=0) at end
@@ -1180,6 +1285,10 @@ fn dodecode(
                 *item = -*item;
             }
         }
+    }
+    if b2.overrun {
+        ffpmsg("dodecode: compressed stream is truncated");
+        return Err(DecodeError::BadFileFormat);
     }
     Ok(())
 }
@@ -1234,16 +1343,23 @@ fn dodecode64(
         &mut b2,
     )?;
 
-    if ny * nx2 + ny2 < a.len() {
-        qtree_decode64(
-            infile,
-            &mut a[(ny * nx2 + ny2)..],
-            ny,
-            nx / 2,
-            ny / 2,
-            i32::from(nbitplanes[2]),
-            &mut b2,
-        )?;
+    // When nx or ny is 1 this quadrant is empty and its offset can lie one
+    // past the end of the image; C still reads its (empty) bit planes, so do
+    // the same rather than skip them.
+    let q4 = (ny * nx2 + ny2).min(a.len());
+    qtree_decode64(
+        infile,
+        &mut a[q4..],
+        ny,
+        nx / 2,
+        ny / 2,
+        i32::from(nbitplanes[2]),
+        &mut b2,
+    )?;
+
+    if b2.overrun {
+        ffpmsg("dodecode64: compressed stream is truncated");
+        return Err(DecodeError::BadFileFormat);
     }
 
     // make sure there is an EOF symbol (nybble=0) at end
@@ -1259,6 +1375,10 @@ fn dodecode64(
         if *item > 0 && input_bit(infile, &mut b2) > 0 {
             *item = -*item;
         }
+    }
+    if b2.overrun {
+        ffpmsg("dodecode64: compressed stream is truncated");
+        return Err(DecodeError::BadFileFormat);
     }
     Ok(())
 }
@@ -2341,23 +2461,10 @@ fn input_huffman(infile: &mut Cursor<&[u8]>, b2: &mut Buffer2) -> i32 {
 /// This routine is only called to read the first 3 values
 /// in the compressed file, so it doesn't have to be
 /// super-efficient
-#[must_use]
-fn readint(infile: &mut Cursor<&[u8]>) -> i32 {
+fn readint(infile: &mut Cursor<&[u8]>) -> Result<i32, DecodeError> {
     let mut b: [u8; 4] = [0; 4];
-
-    /*
-    for i in 0..4 {
-        qread(infile, &mut b[i..i], 1);
-    }
-    */
-    qread(infile, &mut b, 4);
-
-    let mut a: i32 = i32::from(b[0]);
-
-    for &byte in &b[1..4] {
-        a = (a << 8) + i32::from(byte);
-    }
-    a
+    qread(infile, &mut b, 4)?;
+    Ok(i32::from_be_bytes(b))
 }
 
 /*  ############################################################################  */
@@ -2368,26 +2475,54 @@ fn readint(infile: &mut Cursor<&[u8]>) -> i32 {
 /// This routine is only called to read the first 3 values
 /// in the compressed file, so it doesn't have to be
 /// super-efficient
-#[must_use]
-fn readlonglong(infile: &mut Cursor<&[u8]>) -> i64 {
+fn readlonglong(infile: &mut Cursor<&[u8]>) -> Result<i64, DecodeError> {
     let mut b: [u8; 8] = [0; 8];
-
-    for i in 0..8 {
-        qread(infile, &mut b[i..], 1);
-    }
-
-    let mut a: i64 = i64::from(b[0]);
-
-    for &byte in &b[1..8] {
-        a = (a << 8) + i64::from(byte);
-    }
-    a
+    qread(infile, &mut b, 8)?;
+    Ok(i64::from_be_bytes(b))
 }
 
 /*  ############################################################################  */
 /// read n bytes from file into buffer
-fn qread(file: &mut Cursor<&[u8]>, buffer: &mut [u8], n: usize) {
-    file.copy_to_slice(&mut buffer[0..n]);
+///
+/// Fails with `BadFileFormat` if fewer than `n` bytes remain, leaving the
+/// read position unchanged.
+fn qread(file: &mut Cursor<&[u8]>, buffer: &mut [u8], n: usize) -> Result<(), DecodeError> {
+    let pos = usize::try_from(file.position()).unwrap_or(usize::MAX);
+    let src = file
+        .get_ref()
+        .get(pos..)
+        .and_then(|rest| rest.get(..n))
+        .ok_or(DecodeError::BadFileFormat)?;
+    buffer[..n].copy_from_slice(src);
+    file.set_position((pos + n) as u64);
+    Ok(())
+}
+
+/*  ############################################################################  */
+/// Read the next byte of the bit stream.
+///
+/// The C original reads past the end of a truncated stream into whatever
+/// memory follows it.  Here a read past the end yields zero bits and sets
+/// `b2.overrun`, which the caller turns into an error once the current
+/// decoding pass is complete.  Keeping the hot bit-input routines infallible
+/// this way leaves them as cheap as before; a well-formed stream never sets
+/// the flag, so its output is unaffected.
+#[inline]
+fn next_byte(infile: &mut Cursor<&[u8]>, b2: &mut Buffer2) -> i32 {
+    let pos = infile.position();
+    match usize::try_from(pos)
+        .ok()
+        .and_then(|p| infile.get_ref().get(p))
+    {
+        Some(&byte) => {
+            infile.set_position(pos + 1);
+            i32::from(byte)
+        }
+        None => {
+            b2.overrun = true;
+            0
+        }
+    }
 }
 
 /*  ############################################################################  */
@@ -2398,6 +2533,7 @@ fn start_inputing_bits() -> Buffer2 {
     Buffer2 {
         buffer2: 0,    // Buffer is empty to start
         bits_to_go: 0, // with
+        overrun: false,
     }
 }
 
@@ -2407,7 +2543,7 @@ fn input_bit(infile: &mut Cursor<&[u8]>, b2: &mut Buffer2) -> i32 {
     if b2.bits_to_go == 0 {
         // Read the next byte if no
 
-        b2.buffer2 = infile.get_u8() as i32;
+        b2.buffer2 = next_byte(infile, b2);
         //b2.nextchar += 1;
 
         b2.bits_to_go = 8;
@@ -2427,7 +2563,7 @@ fn input_nbits(infile: &mut Cursor<&[u8]>, n: usize, b2: &mut Buffer2) -> i32 {
     if b2.bits_to_go < n as i32 {
         // need another byte's worth of bits
 
-        b2.buffer2 = (b2.buffer2 << 8) | infile.get_u8() as i32;
+        b2.buffer2 = (b2.buffer2 << 8) | next_byte(infile, b2);
         b2.bits_to_go += 8;
     }
 
@@ -2445,7 +2581,7 @@ fn input_nybble(infile: &mut Cursor<&[u8]>, b2: &mut Buffer2) -> i32 {
     if b2.bits_to_go < 4 {
         // need another byte's worth of bits
 
-        b2.buffer2 = (b2.buffer2 << 8) | infile.get_u8() as i32;
+        b2.buffer2 = (b2.buffer2 << 8) | next_byte(infile, b2);
         b2.bits_to_go += 8;
     }
 
@@ -2473,7 +2609,7 @@ fn input_nnybble(infile: &mut Cursor<&[u8]>, n: usize, array: &mut [u8], b2: &mu
         // backspace the infile array to reuse last char
 
         // TODO
-        infile.set_position(infile.position() - 1);
+        infile.set_position(infile.position().saturating_sub(1));
         b2.bits_to_go = 0;
     }
 
@@ -2489,7 +2625,7 @@ fn input_nnybble(infile: &mut Cursor<&[u8]>, n: usize, array: &mut [u8], b2: &mu
         for _ii in 0..(n / 2) {
             // refill the buffer with next byte
 
-            b2.buffer2 = (b2.buffer2 << 8) | infile.get_u8() as i32;
+            b2.buffer2 = (b2.buffer2 << 8) | next_byte(infile, b2);
             array[kk] = ((b2.buffer2 >> 4) & 15) as u8;
             array[kk + 1] = ((b2.buffer2) & 15) as u8; // no shift required
             kk += 2;
@@ -2497,7 +2633,7 @@ fn input_nnybble(infile: &mut Cursor<&[u8]>, n: usize, array: &mut [u8], b2: &mu
     } else {
         for _ii in 0..(n / 2) {
             // refill the buffer with next byte
-            b2.buffer2 = (b2.buffer2 << 8) | infile.get_u8() as i32;
+            b2.buffer2 = (b2.buffer2 << 8) | next_byte(infile, b2);
             array[kk] = ((b2.buffer2 >> shift1) & 15) as u8;
             array[kk + 1] = ((b2.buffer2 >> shift2) & 15) as u8;
             kk += 2;
@@ -2517,6 +2653,7 @@ fn input_nnybble(infile: &mut Cursor<&[u8]>, n: usize, array: &mut [u8], b2: &mu
 mod tests {
 
     use super::*;
+    use quickcheck::TestResult;
     #[test]
     fn test_fits_decompress() {
         let input: [u8; 48] = [
@@ -2791,7 +2928,7 @@ mod tests {
         let mut input_c = Cursor::new(&input[..]);
         let mut buffer = [99, 99, 99, 99];
 
-        qread(&mut input_c, &mut buffer, 2);
+        qread(&mut input_c, &mut buffer, 2).unwrap();
 
         assert_eq!(input_c.position(), 2);
         assert_eq!(buffer, [1, 2, 99, 99]);
@@ -2800,7 +2937,7 @@ mod tests {
         let mut input_c = Cursor::new(&input[..]);
         let mut buffer = [99, 99, 99, 99];
 
-        qread(&mut input_c, &mut buffer[2..], 2);
+        qread(&mut input_c, &mut buffer[2..], 2).unwrap();
 
         assert_eq!(input_c.position(), 2);
         assert_eq!(buffer, [99, 99, 1, 2]);
@@ -2841,6 +2978,7 @@ mod tests {
         let mut b2 = Buffer2 {
             bits_to_go: 5,
             buffer2: 2123985925,
+            overrun: false,
         };
 
         let input: [u8; 140] = [
@@ -2863,5 +3001,251 @@ mod tests {
         assert_eq!(array, [2, 8, 10, 8]);
 
         //n=4  array=[0,10,8,0] bits_to_go=5, buffer2=2123985925, ---->  buffer2=1946490143  bits_to_go=5  array=[2,8,10,8]
+    }
+
+    // ---------------------------------------------------------------------
+    // Malformed input.  Each of these panicked (with overflow checks on, as
+    // in a debug build) before the decoder validated its input.
+
+    /// The 4 x 4 lossless stream from `test_fits_decompress`.
+    const VALID_4X4: [u8; 48] = [
+        221, 153, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 5, 5, 5, 245, 231,
+        227, 199, 253, 227, 199, 253, 247, 255, 120, 249, 245, 239, 254, 241, 255, 124, 120, 251,
+        0, 68, 200,
+    ];
+
+    /// A header: magic, nx, ny, scale, sumall, then the three bit-plane counts.
+    fn header(nx: i32, ny: i32, scale: i32, sumall: i64, nbitplanes: [u8; 3]) -> Vec<u8> {
+        let mut v = CODE_MAGIC.to_vec();
+        v.extend_from_slice(&nx.to_be_bytes());
+        v.extend_from_slice(&ny.to_be_bytes());
+        v.extend_from_slice(&scale.to_be_bytes());
+        v.extend_from_slice(&sumall.to_be_bytes());
+        v.extend_from_slice(&nbitplanes);
+        v
+    }
+
+    fn decode32(input: &[u8], len: usize) -> Result<(usize, usize, i32), DecodeError> {
+        HCDecoder::new().read(input, 0, &mut vec![0; len])
+    }
+
+    fn decode64(input: &[u8], len: usize) -> Result<(usize, usize, i32), DecodeError> {
+        HCDecoder::new().read64(input, 0, &mut vec![0; len])
+    }
+
+    #[test]
+    fn zero_or_negative_dimensions_are_rejected() {
+        // ny == 0 was a division by zero in the overflow check.
+        for (nx, ny) in [(4, 0), (0, 4), (0, 0), (-1, 4), (4, -1), (i32::MIN, 1)] {
+            let mut input = header(nx, ny, 0, 0, [0; 3]);
+            input.extend_from_slice(&[0; 8]);
+            assert_eq!(
+                decode32(&input, 16),
+                Err(DecodeError::BadFileFormat),
+                "{nx} x {ny}"
+            );
+            assert_eq!(
+                decode64(&input, 16),
+                Err(DecodeError::BadFileFormat),
+                "{nx} x {ny}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_dimensions_are_rejected() {
+        let input = header(i32::MAX, 2, 0, 0, [0; 3]);
+        assert_eq!(decode32(&input, 16), Err(DecodeError::NumericalOverflow));
+        let input = header(5, 5, 0, 0, [0; 3]);
+        assert_eq!(
+            decode32(&input, 16),
+            Err(DecodeError::IncorrectAllocationSize)
+        );
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error() {
+        // Every proper prefix of a valid stream, from the empty slice (a
+        // short read of the magic) through the header and into the bit
+        // planes and sign bits.
+        for len in 0..VALID_4X4.len() {
+            assert!(decode32(&VALID_4X4[..len], 16).is_err(), "prefix {len}");
+            assert!(decode64(&VALID_4X4[..len], 16).is_err(), "prefix {len}");
+        }
+        assert!(decode32(&VALID_4X4, 16).is_ok());
+    }
+
+    #[test]
+    fn test_qread_short() {
+        let input: [u8; 3] = [1, 2, 3];
+        let mut input_c = Cursor::new(&input[..]);
+        let mut buffer = [0; 4];
+        assert_eq!(
+            qread(&mut input_c, &mut buffer, 4),
+            Err(DecodeError::BadFileFormat)
+        );
+        // A failed read consumes nothing.
+        assert_eq!(input_c.position(), 0);
+        qread(&mut input_c, &mut buffer, 3).unwrap();
+        assert_eq!(buffer, [1, 2, 3, 0]);
+        assert!(qread(&mut input_c, &mut buffer, 1).is_err());
+    }
+
+    #[test]
+    fn too_many_bit_planes_are_rejected() {
+        // A quadrant claiming 40 bit planes in a 32-bit image used to reach
+        // qtree_bitins with bit = 39 and overflow `1 << bit`.
+        let mut input = header(4, 4, 0, 0, [40, 0, 0]);
+        input.extend_from_slice(&[0; 64]);
+        assert_eq!(decode32(&input, 16), Err(DecodeError::BadBitPlaneValues));
+        // 40 planes is fine for a 64-bit image, but 65 is not.
+        let mut input = header(4, 4, 0, 0, [0, 0, 65]);
+        input.extend_from_slice(&[0; 64]);
+        assert_eq!(decode64(&input, 16), Err(DecodeError::BadBitPlaneValues));
+    }
+
+    #[test]
+    fn huge_scale_wraps_like_c() {
+        // scale * coefficient overflows; C's int arithmetic wraps.
+        let mut input = header(2, 2, i32::MAX, 0x1234_5678, [0; 3]);
+        input.push(0); // EOF nybble
+        assert!(decode32(&input, 4).is_ok());
+        assert!(decode64(&input, 4).is_ok());
+
+        let mut a = [i32::MAX, -7, 3, i32::MIN];
+        undigitize(&mut a, 2, 2, 3);
+        assert_eq!(
+            a,
+            [i32::MAX.wrapping_mul(3), -21, 9, i32::MIN.wrapping_mul(3)]
+        );
+    }
+
+    #[test]
+    fn undigitize_scales_every_pixel() {
+        // C multiplies a[0] .. a[nx*ny-1]; the last one used to be skipped.
+        let mut a = [1, 2, 3, 4, 5, 6, 99];
+        undigitize(&mut a, 2, 3, 10);
+        assert_eq!(a, [10, 20, 30, 40, 50, 60, 99]);
+        let mut a = [1i64, 2, 3, 4, 5, 6, 99];
+        undigitize64(&mut a, 3, 2, 10);
+        assert_eq!(a, [10, 20, 30, 40, 50, 60, 99]);
+    }
+
+    #[test]
+    fn hinv_wraps_like_c() {
+        // Coefficients from a corrupt stream can overflow the sums.
+        let mut a = [i32::MAX; 16];
+        hinv(&mut a, 4, 4, 0, 0).unwrap();
+        let mut a = [i32::MIN, i32::MAX, i32::MIN, i32::MAX];
+        hinv(&mut a, 2, 2, 1, 2).unwrap();
+        let mut a = [i64::MAX; 16];
+        hinv64(&mut a, 4, 4, 0, 0).unwrap();
+    }
+
+    /// A noisy 3 x 10 image compressed with scale 6, and CFITSIO's
+    /// decompression of it without and with smoothing.  The shape matters:
+    /// with nx much smaller than ny the first expansion level has nxtop = 1.
+    const LOSSY_3X10: [u8; 87] = [
+        221, 153, 0, 0, 0, 3, 0, 0, 0, 10, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 32, 9, 7, 7, 246, 215,
+        252, 5, 69, 233, 144, 83, 32, 5, 47, 118, 39, 218, 96, 183, 64, 3, 30, 220, 130, 177, 0,
+        65, 123, 179, 208, 90, 47, 119, 39, 254, 247, 105, 123, 76, 18, 32, 48, 32, 35, 32, 3, 35,
+        219, 176, 4, 143, 105, 122, 111, 221, 187, 12, 72, 8, 200, 0, 57, 226, 84, 184,
+    ];
+    const LOSSY_3X10_C: [i32; 30] = [
+        -88, 113, -87, -147, 104, 149, -200, -98, 6, -57, 107, -118, -165, 195, 38, 53, 58, -146,
+        180, -141, -127, -142, -184, -22, -160, -94, 150, -45, 80, 158,
+    ];
+    const LOSSY_3X10_C_SMOOTH: [i32; 30] = [
+        -88, 113, -87, -147, 104, 149, -199, -97, 6, -57, 107, -118, -165, 195, 38, 53, 59, -145,
+        180, -141, -127, -142, -184, -22, -160, -94, 151, -43, 80, 158,
+    ];
+
+    #[test]
+    fn lossy_decode_matches_cfitsio() {
+        // undigitize used to leave the last coefficient unscaled.
+        let mut out = vec![0i32; 30];
+        let res = HCDecoder::new().read(&LOSSY_3X10, 0, &mut out).unwrap();
+        assert_eq!(res, (3, 10, 6));
+        assert_eq!(out, LOSSY_3X10_C);
+
+        let mut out = vec![0i64; 30];
+        HCDecoder::new().read64(&LOSSY_3X10, 0, &mut out).unwrap();
+        let out: &[i32] = bytemuck::cast_slice(&out);
+        assert_eq!(out[..30], LOSSY_3X10_C);
+    }
+
+    #[test]
+    fn smoothed_decode_matches_cfitsio() {
+        // hsmooth's `nxtop - 2` loop bounds underflowed whenever nxtop or
+        // nytop was below 2, and in a release build ran off the array.
+        let mut out = vec![0i32; 30];
+        HCDecoder::new().read(&LOSSY_3X10, 1, &mut out).unwrap();
+        assert_eq!(out, LOSSY_3X10_C_SMOOTH);
+
+        let mut out = vec![0i64; 30];
+        HCDecoder::new().read64(&LOSSY_3X10, 1, &mut out).unwrap();
+        let out: &[i32] = bytemuck::cast_slice(&out);
+        assert_eq!(out[..30], LOSSY_3X10_C_SMOOTH);
+    }
+
+    #[test]
+    fn one_pixel_image_round_trips() {
+        // hinv computed 1 << (log2n - 1) with log2n == 0.
+        for (pixel, scale) in [(42, 0), (-3, 0), (32767, 0), (1000, 4)] {
+            let mut compressed = Vec::new();
+            crate::write::HCEncoder::new(&mut compressed)
+                .write(&mut [pixel], 1, 1, scale)
+                .unwrap();
+            let mut out = [0i32; 1];
+            HCDecoder::new().read(&compressed, 0, &mut out).unwrap();
+            assert_eq!(out, [pixel]);
+
+            let mut compressed = Vec::new();
+            crate::write::HCEncoder::new(&mut compressed)
+                .write64(&mut [i64::from(pixel)], 1, 1, scale)
+                .unwrap();
+            let mut out = [0i64; 1];
+            HCDecoder::new().read64(&compressed, 0, &mut out).unwrap();
+            let out: &[i32] = bytemuck::cast_slice(&out);
+            assert_eq!(out[0], pixel);
+        }
+    }
+
+    quickcheck! {
+        fn arbitrary_bytes_never_panic(input: Vec<u8>, smooth: bool) -> bool {
+            let smooth = i32::from(smooth);
+            let _ = HCDecoder::new().read(&input, smooth, &mut [0; 64]);
+            let _ = HCDecoder::new().read64(&input, smooth, &mut [0; 64]);
+            true
+        }
+
+        fn corrupted_streams_never_panic(
+            pixels: Vec<i16>,
+            ny: u8,
+            scale: u8,
+            edits: Vec<(u16, u8)>,
+            cut: u16,
+            smooth: bool
+        ) -> TestResult {
+            let ny = usize::from(ny % 16) + 1;
+            let nx = pixels.len() / ny;
+            if nx == 0 {
+                return TestResult::discard();
+            }
+            let mut image: Vec<i32> = pixels[..nx * ny].iter().map(|&p| i32::from(p)).collect();
+            let mut stream = Vec::new();
+            crate::write::HCEncoder::new(&mut stream)
+                .write(&mut image, ny, nx, i32::from(scale))
+                .unwrap();
+            for (at, byte) in edits {
+                let at = usize::from(at) % stream.len();
+                stream[at] ^= byte;
+            }
+            stream.truncate(stream.len() - usize::from(cut) % 4);
+            let smooth = i32::from(smooth);
+            let _ = HCDecoder::new().read(&stream, smooth, &mut vec![0; nx * ny]);
+            let _ = HCDecoder::new().read64(&stream, smooth, &mut vec![0; nx * ny]);
+            TestResult::passed()
+        }
     }
 }
